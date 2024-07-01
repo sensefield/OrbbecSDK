@@ -1,90 +1,138 @@
-#include "libobsensor/ObSensor.hpp"
-// #include "opencv2/opencv.hpp"
+#include <pcl/visualization/cloud_viewer.h>
+#include <pcl_conversions/pcl_conversions.h>
+
 #include <fstream>
 #include <iostream>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+
+#include "libobsensor/ObSensor.hpp"
 #include "utils.hpp"
 
 #define KEY_ESC 27
+#define KEY_R 82
+#define KEY_r 114
 
-void savePointsToPly(std::shared_ptr<ob::Frame> frame, std::string fileName) {
-    int   pointsSize = frame->dataSize() / sizeof(OBPoint);
-    FILE *fp         = fopen(fileName.c_str(), "wb+");
-    fprintf(fp, "ply\n");
-    fprintf(fp, "format ascii 1.0\n");
-    fprintf(fp, "element vertex %d\n", pointsSize);
-    fprintf(fp, "property float x\n");
-    fprintf(fp, "property float y\n");
-    fprintf(fp, "property float z\n");
-    fprintf(fp, "end_header\n");
+class PointCloudPublisher : public rclcpp::Node {
+ public:
+  PointCloudPublisher() : Node("point_cloud_publisher") {
+    publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+        "point_cloud", 10);
+  }
 
-    OBPoint *point = (OBPoint *)frame->data();
-    for(int i = 0; i < pointsSize; i++) {
-        fprintf(fp, "%.3f %.3f %.3f\n", point->x, point->y, point->z);
-        point++;
-    }
+  void publishPointCloud(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud) {
+    sensor_msgs::msg::PointCloud2 output;
+    pcl::toROSMsg(*cloud, output);
+    output.header.frame_id = "map";
+    publisher_->publish(output);
+  }
 
-    fflush(fp);
-    fclose(fp);
+ private:
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
+};
+
+// Save point cloud data to ply
+void savePointsToPly(std::shared_ptr<ob::Frame> frame, std::string fileName,
+                     std::shared_ptr<PointCloudPublisher> publisher) {
+  int pointsSize = frame->dataSize() / sizeof(OBPoint);
+  OBPoint *point = (OBPoint *)frame->data();
+  pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(
+      new pcl::PointCloud<pcl::PointXYZ>());
+  cloud->width = pointsSize;
+  cloud->height = 1;
+  cloud->is_dense = false;
+  cloud->points.resize(cloud->width * cloud->height);
+  for (int i = 0; i < pointsSize; i++) {
+    cloud->points[i].x = static_cast<float>(point->x) * 0.001f;
+    cloud->points[i].y = static_cast<float>(point->y) * 0.001f;
+    cloud->points[i].z = static_cast<float>(point->z) * 0.001f;
+    point++;
+  }
+  publisher->publishPointCloud(cloud);
 }
 
 int main(int argc, char **argv) try {
-    ob::Context::setLoggerSeverity(OB_LOG_SEVERITY_WARN);
-    ob::Pipeline pipeline;
-    std::shared_ptr<ob::Config> config = std::make_shared<ob::Config>();
-    std::shared_ptr<ob::StreamProfileList> depthProfileList;
+  rclcpp::init(argc, argv);
+  auto node = std::make_shared<PointCloudPublisher>();
+
+  ob::Context::setLoggerSeverity(OB_LOG_SEVERITY_WARN);
+  ob::Pipeline pipeline;
+  std::shared_ptr<ob::Config> config = std::make_shared<ob::Config>();
+  std::shared_ptr<ob::VideoStreamProfile> colorProfile = nullptr;
+  try {
+    auto colorProfiles = pipeline.getStreamProfileList(OB_SENSOR_COLOR);
+    if (colorProfiles) {
+      auto profile = colorProfiles->getProfile(OB_PROFILE_DEFAULT);
+      colorProfile = profile->as<ob::VideoStreamProfile>();
+    }
+    config->enableStream(colorProfile);
+  } catch (ob::Error &e) {
+    config->setAlignMode(ALIGN_DISABLE);
+    std::cerr << "Current device is not support color sensor!" << std::endl;
+  }
+  std::shared_ptr<ob::StreamProfileList> depthProfileList;
+  OBAlignMode alignMode = ALIGN_DISABLE;
+  if (colorProfile) {
+    depthProfileList =
+        pipeline.getD2CDepthProfileList(colorProfile, ALIGN_D2C_HW_MODE);
+    if (depthProfileList->count() > 0) {
+      alignMode = ALIGN_D2C_HW_MODE;
+    } else {
+      depthProfileList =
+          pipeline.getD2CDepthProfileList(colorProfile, ALIGN_D2C_SW_MODE);
+      if (depthProfileList->count() > 0) {
+        alignMode = ALIGN_D2C_SW_MODE;
+      }
+    }
+  } else {
     depthProfileList = pipeline.getStreamProfileList(OB_SENSOR_DEPTH);
-    if(depthProfileList->count() > 0) {
-        std::shared_ptr<ob::StreamProfile> depthProfile;
-        depthProfile = depthProfileList->getProfile(OB_PROFILE_DEFAULT);
-        config->enableStream(depthProfile);
+  }
+
+  if (depthProfileList->count() > 0) {
+    std::shared_ptr<ob::StreamProfile> depthProfile;
+    try {
+      if (colorProfile) {
+        depthProfile = depthProfileList->getVideoStreamProfile(
+            OB_WIDTH_ANY, OB_HEIGHT_ANY, OB_FORMAT_ANY, colorProfile->fps());
+      }
+    } catch (...) {
+      depthProfile = nullptr;
     }
 
-    pipeline.start(config);
-    ob::PointCloudFilter pointCloud;
-    auto cameraParam = pipeline.getCameraParam();
-    pointCloud.setCameraParam(cameraParam);
-
-    int count = 0;
-    while(true) {
-        auto frameset = pipeline.waitForFrames(100);
-        if(kbhit()) {
-            int key = getch();
-            if(key == KEY_ESC) {
-                break;
-            }            
-            else if(key == 'D' || key == 'd') {
-                count = 0;
-                // Limit up to 10 repetitions
-                while(count++ < 10) {
-                    // Wait for up to 100ms for a frameset in blocking mode.
-                    auto frameset = pipeline.waitForFrames(100);
-                    if(frameset != nullptr && frameset->depthFrame() != nullptr) {
-                        // point position value multiply depth value scale to convert uint to millimeter (for some devices, the default depth value uint is not
-                        // millimeter)
-                        auto depthValueScale = frameset->depthFrame()->getValueScale();
-                        pointCloud.setPositionDataScaled(depthValueScale);
-                        try {
-                            // generate point cloud and save
-                            std::cout << "Save Depth PointCloud to ply file..." << std::endl;
-                            pointCloud.setCreatePointFormat(OB_FORMAT_POINT);
-                            std::shared_ptr<ob::Frame> frame = pointCloud.process(frameset);
-                            savePointsToPly(frame, "DepthPoints.ply");
-                            std::cout << "DepthPoints.ply Saved" << std::endl;
-                        }
-                        catch(std::exception &e) {
-                            std::cout << "Get point cloud failed" << std::endl;
-                        }
-                        break;
-                    }
-                }
-            }
-        }
+    if (!depthProfile) {
+      depthProfile = depthProfileList->getProfile(OB_PROFILE_DEFAULT);
     }
-    // stop the pipeline
-    pipeline.stop();
-    return 0;
-}
-catch(ob::Error &e) {
-    std::cerr << "function:" << e.getName() << "\nargs:" << e.getArgs() << "\nmessage:" << e.getMessage() << "\ntype:" << e.getExceptionType() << std::endl;
-    exit(EXIT_FAILURE);
+    config->enableStream(depthProfile);
+  }
+  config->setAlignMode(alignMode);
+
+  pipeline.start(config);
+  ob::PointCloudFilter pointCloud;
+  auto cameraParam = pipeline.getCameraParam();
+  pointCloud.setCameraParam(cameraParam);
+
+  int count = 0;
+  while (rclcpp::ok()) {
+    auto frameset = pipeline.waitForFrames(100);
+    if (frameset != nullptr && frameset->depthFrame() != nullptr) {
+      auto depthValueScale = frameset->depthFrame()->getValueScale();
+      pointCloud.setPositionDataScaled(depthValueScale);
+      try {
+        pointCloud.setCreatePointFormat(OB_FORMAT_POINT);
+        std::shared_ptr<ob::Frame> frame = pointCloud.process(frameset);
+        savePointsToPly(frame, "DepthPoints.ply", node);
+      } catch (std::exception &e) {
+        std::cout << "Get point cloud failed" << std::endl;
+      }
+    }
+  }
+
+  pipeline.stop();
+  rclcpp::shutdown();
+  return 0;
+} catch (ob::Error &e) {
+  std::cerr << "function:" << e.getName() << "\nargs:" << e.getArgs()
+            << "\nmessage:" << e.getMessage()
+            << "\ntype:" << e.getExceptionType() << std::endl;
+  exit(EXIT_FAILURE);
 }
