@@ -1,4 +1,3 @@
-#include <pcl/visualization/cloud_viewer.h>
 #include <pcl_conversions/pcl_conversions.h>
 
 #include <fstream>
@@ -9,21 +8,16 @@
 #include "libobsensor/ObSensor.hpp"
 #include "utils.hpp"
 
-#define KEY_ESC 27
-#define KEY_R 82
-#define KEY_r 114
-
 class PointCloudPublisher : public rclcpp::Node {
  public:
   PointCloudPublisher() : Node("point_cloud_publisher") {
     publisher_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
         "point_cloud", 10);
   }
-
   void publishPointCloud(pcl::PointCloud<pcl::PointXYZ>::Ptr cloud) {
     sensor_msgs::msg::PointCloud2 output;
     pcl::toROSMsg(*cloud, output);
-    output.header.frame_id = "map";
+    output.header.frame_id = "sensor_frame";
     publisher_->publish(output);
   }
 
@@ -31,9 +25,8 @@ class PointCloudPublisher : public rclcpp::Node {
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr publisher_;
 };
 
-// Save point cloud data to ply
-void savePointsToPly(std::shared_ptr<ob::Frame> frame, std::string fileName,
-                     std::shared_ptr<PointCloudPublisher> publisher) {
+void createPointCloud(std::shared_ptr<ob::Frame> frame,
+                      std::shared_ptr<PointCloudPublisher> publisher) {
   int pointsSize = frame->dataSize() / sizeof(OBPoint);
   OBPoint *point = (OBPoint *)frame->data();
   pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(
@@ -51,7 +44,7 @@ void savePointsToPly(std::shared_ptr<ob::Frame> frame, std::string fileName,
   publisher->publishPointCloud(cloud);
 }
 
-int main(int argc, char **argv) try {
+int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
   auto node = std::make_shared<PointCloudPublisher>();
 
@@ -111,7 +104,6 @@ int main(int argc, char **argv) try {
   auto cameraParam = pipeline.getCameraParam();
   pointCloud.setCameraParam(cameraParam);
 
-  int count = 0;
   while (rclcpp::ok()) {
     auto frameset = pipeline.waitForFrames(100);
     if (frameset != nullptr && frameset->depthFrame() != nullptr) {
@@ -120,7 +112,7 @@ int main(int argc, char **argv) try {
       try {
         pointCloud.setCreatePointFormat(OB_FORMAT_POINT);
         std::shared_ptr<ob::Frame> frame = pointCloud.process(frameset);
-        savePointsToPly(frame, "DepthPoints.ply", node);
+        createPointCloud(frame, node);
       } catch (std::exception &e) {
         std::cout << "Get point cloud failed" << std::endl;
       }
@@ -130,9 +122,4 @@ int main(int argc, char **argv) try {
   pipeline.stop();
   rclcpp::shutdown();
   return 0;
-} catch (ob::Error &e) {
-  std::cerr << "function:" << e.getName() << "\nargs:" << e.getArgs()
-            << "\nmessage:" << e.getMessage()
-            << "\ntype:" << e.getExceptionType() << std::endl;
-  exit(EXIT_FAILURE);
 }

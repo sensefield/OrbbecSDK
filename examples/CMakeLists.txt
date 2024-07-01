@@ -22,7 +22,6 @@ if(UNIX)
     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 endif()
 
-add_subdirectory(c)
 add_subdirectory(cpp)
 
 install(DIRECTORY
